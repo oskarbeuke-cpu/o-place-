@@ -1,0 +1,123 @@
+// Eigenes r/place - Server
+// Haelt das Pixel-Grid im Speicher, sichert es periodisch auf die Festplatte,
+// und verteilt jede Pixel-Aenderung in Echtzeit per WebSocket an alle Verbundenen.
+
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
+
+const GRID_SIZE = 200;
+const COOLDOWN_MS = 30 * 1000; // 30 Sekunden, serverseitig erzwungen
+const SAVE_FILE = path.join(__dirname, "grid-save.json");
+const SAVE_INTERVAL_MS = 10 * 1000;
+
+const PALETTE = [
+  "#FFFFFF", "#E4E4E4", "#888888", "#222222",
+  "#FFA7D1", "#E50000", "#E59500", "#A06A42",
+  "#E5D900", "#94E044", "#02BE01", "#00D3DD",
+  "#0083C7", "#0000EA", "#CF6EE4", "#820080"
+];
+
+// --- Grid laden oder neu anlegen ---
+let grid;
+if (fs.existsSync(SAVE_FILE)) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(SAVE_FILE, "utf8"));
+    if (Array.isArray(saved) && saved.length === GRID_SIZE * GRID_SIZE) {
+      grid = saved;
+      console.log("Gespeichertes Grid geladen.");
+    }
+  } catch (e) {
+    console.warn("Konnte gespeichertes Grid nicht laden, starte neu.", e.message);
+  }
+}
+if (!grid) {
+  grid = new Array(GRID_SIZE * GRID_SIZE).fill(0); // Index 0 = Weiss in PALETTE
+}
+
+let dirty = false;
+function saveGrid() {
+  if (!dirty) return;
+  fs.writeFile(SAVE_FILE, JSON.stringify(grid), (err) => {
+    if (err) console.error("Speichern fehlgeschlagen:", err);
+    else dirty = false;
+  });
+}
+setInterval(saveGrid, SAVE_INTERVAL_MS);
+
+// IP -> Zeitstempel des letzten gesetzten Pixels (serverseitiger Cooldown)
+const lastPlacedAt = new Map();
+
+function getClientIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (fwd) return fwd.split(",")[0].trim();
+  return req.socket.remoteAddress;
+}
+
+// --- HTTP Server ---
+const app = express();
+app.use(express.static(path.join(__dirname, "public")));
+app.get("/api/grid", (req, res) => {
+  res.json({ size: GRID_SIZE, palette: PALETTE, grid });
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+function broadcast(data) {
+  const msg = JSON.stringify(data);
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  });
+}
+
+wss.on("connection", (ws, req) => {
+  ws.ip = getClientIp(req);
+
+  ws.send(JSON.stringify({ type: "init", size: GRID_SIZE, palette: PALETTE, grid }));
+
+  ws.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (msg.type !== "place") return;
+
+    const { x, y, colorIndex } = msg;
+    if (
+      !Number.isInteger(x) || !Number.isInteger(y) ||
+      x < 0 || x >= GRID_SIZE || y < 0 || y >= GRID_SIZE ||
+      !Number.isInteger(colorIndex) || colorIndex < 0 || colorIndex >= PALETTE.length
+    ) {
+      return;
+    }
+
+    const now = Date.now();
+    const last = lastPlacedAt.get(ws.ip) || 0;
+    const remaining = COOLDOWN_MS - (now - last);
+    if (remaining > 0) {
+      ws.send(JSON.stringify({ type: "cooldown", remainingMs: remaining }));
+      return;
+    }
+
+    const idx = y * GRID_SIZE + x;
+    grid[idx] = colorIndex;
+    dirty = true;
+    lastPlacedAt.set(ws.ip, now);
+
+    broadcast({ type: "pixel", x, y, colorIndex });
+    ws.send(JSON.stringify({ type: "placed", nextAllowedAt: now + COOLDOWN_MS }));
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`r/place laeuft auf Port ${PORT}`);
+});
+
+process.on("SIGTERM", () => { saveGrid(); process.exit(0); });
+process.on("SIGINT", () => { saveGrid(); process.exit(0); });
